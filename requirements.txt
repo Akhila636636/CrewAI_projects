@@ -1,4 +1,4 @@
-crewai>=0.100.0
+crewai[google-genai]>=0.100.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 requests>=2.31.0
