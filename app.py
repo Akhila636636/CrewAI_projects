@@ -79,62 +79,322 @@ def agent1(q: Query):
     ).kickoff(inputs={"input": q.input})
     return {"output": str(result)}
 
-@app.post("/agent2")
+@app.post("/agent2", summary="Competitor Analysis Crew")
 def agent2(q: Query):
-    api_key = os.getenv("GEMINI_API_KEY")
+    """
+    Input: exactly 3 competitor website URLs.
+    Output: competitor analysis report and saved report.md.
+    """
+
+    # 1. Validate exactly three website URLs
+    raw_urls = re.split(r"[\s,;]+", q.input.strip())
+    urls = [u.strip() for u in raw_urls if u.strip()]
+
+    def is_valid_url(url):
+        try:
+            parsed = urlparse(url)
+            return (
+                parsed.scheme in ("http", "https")
+                and bool(parsed.netloc)
+                and "." in parsed.netloc
+            )
+        except Exception:
+            return False
+
+    if len(urls) != 3 or not all(is_valid_url(u) for u in urls):
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Agent 2 requires exactly 3 valid website URLs, "
+                "separated by new lines, commas, or semicolons."
+            ),
+        )
+
+    # 2. Configure Gemini
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
+        from fastapi import HTTPException
         raise HTTPException(
             status_code=500,
-            detail="GEMINI_API_KEY is not set. Add it to your Colab secrets or deployment environment variables.",
+            detail="GEMINI_API_KEY or GOOGLE_API_KEY is not configured."
         )
+
     llm = LLM(
         model="gemini/gemini-3.1-flash-lite-preview",
         api_key=api_key,
-        temperature=0.3,
+        temperature=0.2,
     )
-    site_analyst = Agent(
-        role="Website and Product Analyst",
-        goal="Extract competitor positioning, products, target customers, and differentiators from the text supplied by the user.",
-        backstory="You analyse business information carefully and do not claim to have browsed URLs unless their content is supplied.",
-        llm=llm, verbose=False, allow_delegation=False,
+
+    # 3. Tools
+    scraper = ScrapeWebsiteTool()
+    file_writer = FileWriterTool()
+
+    @tool("DuckDuckGo Search")
+    def duckduckgo_search(query: str) -> str:
+        """Search DuckDuckGo for recent competitor news, announcements,
+        product launches, partnerships, funding, and market developments."""
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=5))
+
+            if not results:
+                return f"No DuckDuckGo results found for: {query}"
+
+            return "\n".join(
+                f"Title: {item.get('title', '')}\n"
+                f"URL: {item.get('href', '')}\n"
+                f"Summary: {item.get('body', '')}"
+                for item in results
+            )
+        except Exception as exc:
+            return f"DuckDuckGo search failed for '{query}': {exc}"
+
+    competitor_list = "\n".join(
+        f"{i + 1}. {url}" for i, url in enumerate(urls)
     )
+
+    # 4. Manager agent
+    manager = Agent(
+        role="Competitor Research Manager",
+        goal=(
+            "Coordinate competitor research by delegating work to the "
+            "Site Scraper, Pricing Analyst, and News Analyst, then ensure "
+            "their findings are consolidated by the Strategist."
+        ),
+        backstory=(
+            "You manage a market-intelligence team. Assign research tasks "
+            "to the appropriate specialists, monitor the quality of their "
+            "findings, and ensure the final report is evidence-based."
+        ),
+        llm=llm,
+        allow_delegation=True,
+        verbose=True,
+    )
+
+    # 5. Site Scraper agent
+    site_scraper = Agent(
+        role="Site Scraper",
+        goal=(
+            "Extract and summarize the products, services, target customers, "
+            "positioning, and differentiators from all three competitor sites."
+        ),
+        backstory=(
+            "You are a website research specialist. You inspect the supplied "
+            "websites and distinguish retrieved facts from information "
+            "that could not be accessed."
+        ),
+        tools=[scraper],
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    # 6. Pricing Analyst agent
     pricing_analyst = Agent(
         role="Pricing Analyst",
-        goal="Compare pricing details, packaging, and commercial models contained in the input.",
-        backstory="You distinguish known prices from missing or unverified pricing information.",
-        llm=llm, verbose=False, allow_delegation=False,
+        goal=(
+            "Compare competitor pricing, subscription plans, features, "
+            "free tiers, and pricing differences."
+        ),
+        backstory=(
+            "You specialize in competitive pricing research. Use website "
+            "content to identify actual prices and plan features. Never "
+            "invent prices or treat missing information as zero."
+        ),
+        tools=[scraper],
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
     )
-    strategist = Agent(
-        role="Competitive Strategy Consultant",
-        goal="Produce a concise competitor comparison and actionable SWOT-style recommendations.",
-        backstory="You translate competitor observations into practical, evidence-conscious business recommendations.",
-        llm=llm, verbose=False, allow_delegation=False,
-    )
-    analysis_task = Task(
-        description="Analyse the supplied competitor information. Identify each competitor's product, audience, positioning, strengths, and weaknesses. Input may contain URLs, notes, copied website text, or multiple competitors. Do not imply you accessed a URL if only the URL is provided. Input: {input}",
-        expected_output="Structured competitor observations, with unknowns clearly marked.",
-        agent=site_analyst,
-    )
-    pricing_task = Task(
-        description="Extract and compare all pricing, plan, feature-tier, and monetisation information present in the input and prior analysis. Use 'not provided' for missing prices; do not invent numbers.",
-        expected_output="A concise pricing and packaging comparison.",
-        agent=pricing_analyst,
-        context=[analysis_task],
-    )
-    strategy_task = Task(
-        description="Combine the competitor and pricing analyses into a report. Include an executive summary, comparison table, strengths, weaknesses, opportunities, threats, information gaps, and 3 practical next steps. Input: {input}",
-        expected_output="Markdown competitor analysis report with transparent unknowns and actionable recommendations.",
-        agent=strategist,
-        context=[analysis_task, pricing_task],
-    )
-    result = Crew(
-        agents=[site_analyst, pricing_analyst, strategist],
-        tasks=[analysis_task, pricing_task, strategy_task],
-        process=Process.sequential,
-        verbose=False,
-    ).kickoff(inputs={"input": q.input})
-    return {"output": str(result)}
 
+    # 7. News Analyst agent — DuckDuckGo
+    news_analyst = Agent(
+        role="News Analyst",
+        goal=(
+            "Research relevant news and developments for each competitor "
+            "using DuckDuckGo search."
+        ),
+        backstory=(
+            "You monitor market developments, product launches, partnerships, "
+            "funding, and competitive announcements. You provide source URLs "
+            "and dates when available, and distinguish search findings from "
+            "verified facts."
+        ),
+        tools=[duckduckgo_search],
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    # 8. Strategist agent
+    strategist = Agent(
+        role="Competitor Analysis Strategist",
+        goal=(
+            "Combine website, pricing, and news research into a clear "
+            "comparative analysis and SWOT table."
+        ),
+        backstory=(
+            "You are a business strategy analyst. You identify meaningful "
+            "competitive differences, evidence-supported strengths and "
+            "weaknesses, opportunities and threats, and practical "
+            "recommendations."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    # 9. Tasks assigned to the three parallel research specialists
+    site_task = Task(
+        description=f"""
+        Research the following three competitor websites:
+        {competitor_list}
+
+        Use ScrapeWebsiteTool to inspect each URL.
+        For every competitor, report:
+        - Company and product overview
+        - Main products and services
+        - Target customers and positioning
+        - Notable features and differentiators
+        - Evidence retrieved from the site
+        - Any inaccessible pages or missing information
+
+        Do not claim a site was successfully scraped if the tool failed.
+        """,
+        expected_output=(
+            "A competitor-by-competitor website research report with "
+            "retrieved evidence and any access limitations."
+        ),
+        agent=site_scraper,
+    )
+
+    pricing_task = Task(
+        description=f"""
+        Analyse pricing and plans for these three competitors:
+        {competitor_list}
+
+        Inspect the supplied websites using ScrapeWebsiteTool.
+        Look for pricing pages, subscription tiers, published prices,
+        free plans, billing periods, plan features, and restrictions.
+
+        Compare the competitors in a table. Include currency and billing
+        period where available. Mark unavailable prices as 'Not found'.
+        Never fabricate pricing or claim a price was verified when it was not.
+        """,
+        expected_output=(
+            "A comparative pricing and plans table with evidence, "
+            "currency, billing periods, and missing-data notes."
+        ),
+        agent=pricing_analyst,
+    )
+
+    news_task = Task(
+        description=f"""
+        Use the DuckDuckGo Search tool to research each competitor:
+        {competitor_list}
+
+        Search separately for each company or product, using queries for
+        recent news, product launches, partnerships, funding, and market
+        developments. Return relevant headlines, summaries, source URLs,
+        and dates when available.
+
+        Do not invent articles, dates, or events. Clearly report when
+        relevant search results are unavailable.
+        """,
+        expected_output=(
+            "A news and market developments report for all three competitors, "
+            "including source URLs and available publication dates."
+        ),
+        agent=news_analyst,
+    )
+
+    # 10. Strategist task: combine research into the final SWOT report
+    strategy_task = Task(
+        description=f"""
+        Create a comprehensive competitor analysis using the findings
+        from the Site Scraper, Pricing Analyst, and News Analyst.
+
+        Competitors:
+        {competitor_list}
+
+        Include:
+        1. Executive summary
+        2. Overview of all three competitors
+        3. Comparison of products, services, and positioning
+        4. Pricing comparison table
+        5. Relevant news and market developments
+        6. A SWOT table for each competitor:
+           - Strengths
+           - Weaknesses
+           - Opportunities
+           - Threats
+        7. Overall competitive comparison
+        8. Strategic recommendations
+        9. Sources and research limitations
+
+        Base conclusions on the research findings. Label reasonable
+        inferences as inferences and disclose missing evidence.
+        Do not fabricate facts, prices, or news.
+        """,
+        expected_output=(
+            "A complete Markdown competitor analysis report containing "
+            "comparisons, SWOT tables, recommendations, sources, and "
+            "research limitations."
+        ),
+        agent=strategist,
+        context=[site_task, pricing_task, news_task],
+    )
+
+    # 11. Crew: manager coordinates and delegates research
+    crew = Crew(
+        agents=[
+            site_scraper,
+            pricing_analyst,
+            news_analyst,
+            strategist,
+        ],
+        tasks=[
+            site_task,
+            pricing_task,
+            news_task,
+            strategy_task,
+        ],
+        process=Process.hierarchical,
+        manager_agent=manager,
+        manager_llm=llm,
+        verbose=True,
+    )
+
+    try:
+        result = crew.kickoff()
+
+        # 12. Save final report through FileWriterTool
+        report_text = str(result)
+        output_path = str(Path("report.md").resolve())
+
+        file_writer.run(
+            filename=output_path,
+            content=report_text,
+        )
+
+        return {
+            "status": "success",
+            "agent": "Agent 2 - Competitor Analysis Crew",
+            "competitors": urls,
+            "report_file": "report.md",
+            "report": report_text,
+        }
+
+    except Exception as exc:
+        import logging
+        logging.exception("Agent 2 failed")
+
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=500,
+            detail=f"Competitor Analysis Crew failed: {str(exc)}",
+        )
 @app.post("/agent3")
 def agent3(q: Query):
     api_key = os.getenv("GEMINI_API_KEY")
