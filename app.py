@@ -2,28 +2,71 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import os
 import re
 import uuid
+
 from pathlib import Path
 from urllib.parse import urlparse
+from io import BytesIO
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
-from crewai import Agent, Crew, LLM, Process, Task
-from pydantic import BaseModel, Field
-from crewai.tools import tool
-from crewai.flow.flow import Flow, start, listen, router, and_, or_
-from crewai_tools import FileReadTool, FileWriterTool, ScrapeWebsiteTool
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini/gemini-3.1-flash-lite-preview")
+from bs4 import BeautifulSoup
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    UploadFile,
+    File,
+    Form,
+)
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+from crewai import Agent, Crew, LLM, Process, Task
+from crewai.tools import tool
+from crewai.flow.flow import (
+    Flow,
+    start,
+    listen,
+    router,
+    and_,
+    or_,
+)
+
+from crewai_tools import (
+    FileReadTool,
+    FileWriterTool,
+    ScrapeWebsiteTool,
+)
+
+from pypdf import PdfReader
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MODEL_NAME = os.getenv(
+    "GEMINI_MODEL",
+    "gemini/gemini-3.1-flash-lite-preview",
+)
+
 OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-app = FastAPI(title="CREWAI Agent Hub", version="1.0.0")
+
+app = FastAPI(
+    title="CREWAI Agent Hub",
+    version="1.0.0",
+)
 
 
 def unwrap_inputs(payload):
@@ -607,148 +650,352 @@ class ResumeScreeningFlow(Flow[ResumeState]):
 
 @app.post("/agent6", summary="Resume Screening Flow")
 async def agent6(request: Request):
-    content_type = request.headers.get("content-type", "")
+    # Validate request format.
+    content_type = request.headers.get("content-type", "").lower()
 
-    if "multipart/form-data" not in content_type.lower():
+    if "multipart/form-data" not in content_type:
         raise HTTPException(
             status_code=415,
             detail=(
-                "Use multipart/form-data with an inputs JSON field "
-                "containing job_description and one or more TXT/PDF "
-                "files named resumes."
+                'Use form-data with an "inputs" text field '
+                'and one or more "resumes" file fields.'
             ),
         )
 
     form = await request.form()
 
+    # Parse the common inputs envelope.
+    raw_inputs = form.get("inputs")
+
     try:
-        form_inputs = parse_form_inputs(form.get("inputs"))
-    except Exception:
+        if isinstance(raw_inputs, str):
+            inputs = json.loads(raw_inputs)
+        elif isinstance(raw_inputs, dict):
+            inputs = raw_inputs
+        else:
+            raise ValueError("Missing inputs")
+
+        if not isinstance(inputs, dict):
+            raise ValueError("inputs must be a JSON object")
+
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
-            detail='The "inputs" field must be valid JSON containing job_description.',
-        )
+            detail='The "inputs" field must contain valid JSON.',
+        ) from exc
 
-    job = str(form_inputs.get("job_description", "")).strip()
+    job_description = str(inputs.get("job_description", "")).strip()
     uploads = form.getlist("resumes")
 
-    if not job:
+    if not job_description:
         raise HTTPException(
             status_code=422,
-            detail="job_description is required inside inputs.",
+            detail='Add "job_description" inside the "inputs" JSON.',
+        )
+
+    if len(job_description) > 15000:
+        raise HTTPException(
+            status_code=422,
+            detail="Job description must not exceed 15,000 characters.",
         )
 
     if not uploads:
         raise HTTPException(
             status_code=422,
-            detail="Upload at least one TXT or PDF file under resumes.",
+            detail='Upload at least one file using the "resumes" key.',
         )
 
     if len(uploads) > 50:
         raise HTTPException(
             status_code=422,
-            detail="Upload no more than 50 resumes.",
+            detail="Upload no more than 50 resumes per request.",
         )
 
     if not os.getenv("GEMINI_API_KEY"):
         raise HTTPException(
             status_code=503,
-            detail="Set GEMINI_API_KEY before running this agent.",
+            detail="GEMINI_API_KEY is not configured on Render.",
         )
 
-    from io import BytesIO
-    from pypdf import PdfReader
+    # Extract resume text before invoking CrewAI.
+    resumes = []
 
-    staged = []
+    for upload in uploads:
+        filename = Path(
+            getattr(upload, "filename", "") or ""
+        ).name
 
-    try:
-        for upload in uploads:
-            filename = Path(
-                getattr(upload, "filename", "resume.txt") or "resume.txt"
-            ).name
+        suffix = Path(filename).suffix.lower()
 
-            suffix = Path(filename).suffix.lower()
-
-            if suffix not in {".txt", ".pdf"}:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Unsupported file type: {filename}. Upload TXT or PDF files.",
-                )
-
-            raw = await upload.read(MAX_UPLOAD_BYTES + 1)
-
-            if len(raw) > MAX_UPLOAD_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"{filename} exceeds the 5 MB limit.",
-                )
-
-            try:
-                if suffix == ".txt":
-                    text_content = raw.decode(
-                        "utf-8-sig", errors="replace"
-                    ).strip()
-                else:
-                    text_content = "\n".join(
-                        page.extract_text() or ""
-                        for page in PdfReader(BytesIO(raw)).pages
-                    ).strip()
-            except Exception:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Could not read {filename}. Check that the file is valid.",
-                )
-
-            if not text_content:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"No readable text found in {filename}. Scanned PDFs may require OCR.",
-                )
-
-            staged_path = OUTPUT_DIR / f"resume_{uuid.uuid4().hex}.txt"
-            staged_path.write_text(
-                text_content[:30000],
-                encoding="utf-8",
+        if suffix not in {".txt", ".pdf"}:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported file: {filename}. Upload TXT or PDF.",
             )
 
-            staged.append({
-                "filename": filename,
-                "path": str(staged_path),
+        raw = await upload.read(MAX_UPLOAD_BYTES + 1)
+
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{filename} exceeds the 5 MB limit.",
+            )
+
+        try:
+            if suffix == ".txt":
+                resume_text = raw.decode(
+                    "utf-8-sig", errors="replace"
+                ).strip()
+            else:
+                pdf = PdfReader(BytesIO(raw))
+
+                if pdf.is_encrypted:
+                    raise ValueError("Encrypted PDF")
+
+                resume_text = "\n".join(
+                    page.extract_text() or "" for page in pdf.pages
+                ).strip()
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not extract text from {filename}.",
+            ) from exc
+
+        if not resume_text:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"No readable text in {filename}. "
+                    "Scanned PDFs require OCR."
+                ),
+            )
+
+        resumes.append({
+            "filename": filename,
+            "text": resume_text[:30000],
+        })
+
+    # Run CrewAI outside the async request loop.
+    def run_screening():
+        llm = LLM(
+            model=MODEL_NAME,
+            api_key=os.environ["GEMINI_API_KEY"],
+            temperature=0.1,
+        )
+
+        results = []
+
+        scorer = Agent(
+            role="Resume Screening Analyst",
+            goal=(
+                "Evaluate each resume against the job description "
+                "using only evidence in the resume."
+            ),
+            backstory=(
+                "You assess job-related skills and qualifications. "
+                "Never infer protected characteristics. Scores are "
+                "advisory and must be reviewed by a human."
+            ),
+            llm=llm,
+            verbose=False,
+        )
+
+        for resume in resumes:
+            task = Task(
+                description="""
+Evaluate the resume against the job description.
+
+JOB DESCRIPTION:
+{job_description}
+
+CANDIDATE RESUME:
+{resume_text}
+
+Return ONLY valid JSON in this format:
+{
+  "score": 0,
+  "rationale": "Evidence-based explanation",
+  "strengths": ["relevant demonstrated skill"],
+  "gaps": ["missing or unverified job requirement"]
+}
+
+Rules:
+- Score from 0 to 10 based on job-related evidence.
+- Do not invent qualifications.
+- Treat unmentioned skills as unverified, not proof of inability.
+- Do not use protected characteristics in scoring.
+- The result is decision support, not a final hiring decision.
+""",
+                expected_output=(
+                    "JSON containing score, rationale, strengths, and gaps."
+                ),
+                agent=scorer,
+            )
+
+            raw_result = str(
+                Crew(
+                    agents=[scorer],
+                    tasks=[task],
+                    process=Process.sequential,
+                    verbose=False,
+                ).kickoff(
+                    inputs={
+                        "job_description": job_description,
+                        "resume_text": resume["text"],
+                    }
+                )
+            )
+
+            # Parse JSON, including JSON wrapped in a Markdown code block.
+            match = re.search(r"\{[\s\S]*\}", raw_result)
+
+            if not match:
+                raise ValueError(
+                    f"Scoring response for {resume['filename']} "
+                    "did not contain valid JSON."
+                )
+
+            data = json.loads(match.group(0))
+            score = float(data["score"])
+
+            if not 0 <= score <= 10:
+                raise ValueError("The resume score must be between 0 and 10.")
+
+            strengths = data.get("strengths", [])
+            gaps = data.get("gaps", [])
+
+            if not isinstance(strengths, list):
+                strengths = [str(strengths)]
+
+            if not isinstance(gaps, list):
+                gaps = [str(gaps)]
+
+            results.append({
+                "candidate": resume["filename"],
+                "score": round(score, 2),
+                "rationale": str(data.get("rationale", "")),
+                "strengths": strengths,
+                "gaps": gaps,
+                "decision": "pending_human_review",
+                "follow_up": "",
             })
 
-        flow = ResumeScreeningFlow()
-
-        result = await asyncio.to_thread(
-            lambda: flow.kickoff(
-                inputs={
-                    "job_description": job,
-                    "resumes": staged,
-                }
-            )
+        # Draft follow-up for recruiter review.
+        follow_up_agent = Agent(
+            role="Recruiter Assistant",
+            goal=(
+                "Prepare a recruiter-review summary for candidates "
+                "scoring 7 or above, or a polite rejection email draft "
+                "for candidates scoring below 7."
+            ),
+            backstory=(
+                "You assist recruiters. Never send emails or make "
+                "final hiring decisions."
+            ),
+            llm=llm,
+            verbose=False,
         )
+
+        for item in results:
+            if item["score"] >= 7:
+                item["decision"] = "shortlist_for_human_review"
+
+                instruction = (
+                    "Prepare a concise recruiter-review summary with "
+                    "job-related strengths, gaps, and three interview "
+                    "questions. Do not make a final hiring decision."
+                )
+            else:
+                item["decision"] = "below_threshold_for_human_review"
+
+                instruction = (
+                    "Draft a polite rejection email for recruiter review. "
+                    "Do not mention an automated score, send the email, "
+                    "or imply that a final hiring decision was made."
+                )
+
+            task = Task(
+                description=(
+                    "{instruction}\n\n"
+                    "Candidate: {candidate}\n"
+                    "Evaluation: {evaluation}"
+                ),
+                expected_output="A concise draft for human recruiter review.",
+                agent=follow_up_agent,
+            )
+
+            item["follow_up"] = str(
+                Crew(
+                    agents=[follow_up_agent],
+                    tasks=[task],
+                    process=Process.sequential,
+                    verbose=False,
+                ).kickoff(
+                    inputs={
+                        "instruction": instruction,
+                        "candidate": item["candidate"],
+                        "evaluation": json.dumps(item),
+                    }
+                )
+            )
+
+        # Save the report.
+        output = io.StringIO()
+
+        fields = [
+            "candidate",
+            "score",
+            "decision",
+            "rationale",
+            "strengths",
+            "gaps",
+            "follow_up",
+        ]
+
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+
+        for item in results:
+            writer.writerow({
+                key: (
+                    json.dumps(item[key], ensure_ascii=False)
+                    if isinstance(item[key], (list, dict))
+                    else item[key]
+                )
+                for key in fields
+            })
+
+        (OUTPUT_DIR / "results.csv").write_text(
+            output.getvalue(),
+            encoding="utf-8",
+        )
+
+        return results, output.getvalue()
+
+    try:
+        results, csv_content = await asyncio.to_thread(run_screening)
 
         return {
             "agent": "Resume Screening Flow",
             "status": "success",
-            "resumes_processed": len(staged),
-            "result": str(result),
+            "resumes_processed": len(results),
+            "results": results,
+            "csv": csv_content,
+            "file": "outputs/results.csv",
+            "note": "All screening results require human review.",
         }
 
-    except HTTPException:
-        raise
-
     except Exception as exc:
+        logger.exception("Agent 6 failed during resume screening")
+
         raise HTTPException(
             status_code=502,
             detail=(
-                f"Resume Screening Flow failed: {type(exc).__name__}. "
-                "Check the server logs."
+                f"Resume Screening Flow failed: "
+                f"{type(exc).__name__}: {str(exc)}"
             ),
-        )
-
-    finally:
-        for item in staged:
-            Path(item["path"]).unlink(missing_ok=True)
+        ) from exc
 # ---------------------------------------------------------------------------
 # Agent 7 — Bug Triage Flow + category-specific crews
 # ---------------------------------------------------------------------------
