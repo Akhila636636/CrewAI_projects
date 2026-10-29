@@ -607,47 +607,148 @@ class ResumeScreeningFlow(Flow[ResumeState]):
 
 @app.post("/agent6", summary="Resume Screening Flow")
 async def agent6(request: Request):
-    if "multipart/form-data" not in request.headers.get("content-type", ""):
-        raise HTTPException(415, "Use multipart/form-data with an inputs JSON field containing job_description and one or more TXT/PDF files named resumes.")
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" not in content_type.lower():
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Use multipart/form-data with an inputs JSON field "
+                "containing job_description and one or more TXT/PDF "
+                "files named resumes."
+            ),
+        )
+
     form = await request.form()
-    form_inputs = parse_form_inputs(form.get("inputs"))
+
+    try:
+        form_inputs = parse_form_inputs(form.get("inputs"))
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail='The "inputs" field must be valid JSON containing job_description.',
+        )
+
     job = str(form_inputs.get("job_description", "")).strip()
     uploads = form.getlist("resumes")
-    if not job: raise HTTPException(422, "job_description is required.")
-    if not uploads: raise HTTPException(422, "Upload at least one TXT or PDF file under resumes.")
-    if len(uploads) > 50: raise HTTPException(422, "Upload no more than 50 resumes.")
-    if not os.getenv("GEMINI_API_KEY"): raise HTTPException(503, "Set GEMINI_API_KEY before running this agent.")
-    from pypdf import PdfReader
+
+    if not job:
+        raise HTTPException(
+            status_code=422,
+            detail="job_description is required inside inputs.",
+        )
+
+    if not uploads:
+        raise HTTPException(
+            status_code=422,
+            detail="Upload at least one TXT or PDF file under resumes.",
+        )
+
+    if len(uploads) > 50:
+        raise HTTPException(
+            status_code=422,
+            detail="Upload no more than 50 resumes.",
+        )
+
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail="Set GEMINI_API_KEY before running this agent.",
+        )
+
     from io import BytesIO
+    from pypdf import PdfReader
+
     staged = []
-    for upload in uploads:
-        filename = Path(getattr(upload, "filename", "resume.txt") or "resume.txt").name
-        suffix = Path(filename).suffix.lower()
-        raw = await upload.read(MAX_UPLOAD_BYTES + 1)
-        if len(raw) > MAX_UPLOAD_BYTES: continue
-        try:
-            if suffix == ".txt":
-                text_content = raw.decode("utf-8-sig", errors="replace").strip()
-            elif suffix == ".pdf":
-                text_content = "\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(raw)).pages).strip()
-            else:
-                continue
-        except Exception:
-            continue
-        if not text_content: continue
-        staged_path = OUTPUT_DIR / f"resume_{uuid.uuid4().hex}.txt"
-        staged_path.write_text(text_content[:30000], encoding="utf-8")
-        staged.append({"filename": filename, "path": str(staged_path)})
-    if not staged: raise HTTPException(422, "No readable TXT/PDF resume text was found.")
+
     try:
+        for upload in uploads:
+            filename = Path(
+                getattr(upload, "filename", "resume.txt") or "resume.txt"
+            ).name
+
+            suffix = Path(filename).suffix.lower()
+
+            if suffix not in {".txt", ".pdf"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unsupported file type: {filename}. Upload TXT or PDF files.",
+                )
+
+            raw = await upload.read(MAX_UPLOAD_BYTES + 1)
+
+            if len(raw) > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{filename} exceeds the 5 MB limit.",
+                )
+
+            try:
+                if suffix == ".txt":
+                    text_content = raw.decode(
+                        "utf-8-sig", errors="replace"
+                    ).strip()
+                else:
+                    text_content = "\n".join(
+                        page.extract_text() or ""
+                        for page in PdfReader(BytesIO(raw)).pages
+                    ).strip()
+            except Exception:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Could not read {filename}. Check that the file is valid.",
+                )
+
+            if not text_content:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"No readable text found in {filename}. Scanned PDFs may require OCR.",
+                )
+
+            staged_path = OUTPUT_DIR / f"resume_{uuid.uuid4().hex}.txt"
+            staged_path.write_text(
+                text_content[:30000],
+                encoding="utf-8",
+            )
+
+            staged.append({
+                "filename": filename,
+                "path": str(staged_path),
+            })
+
         flow = ResumeScreeningFlow()
-        result = await asyncio.to_thread(lambda: flow.kickoff(inputs={"job_description": job, "resumes": staged}))
+
+        result = await asyncio.to_thread(
+            lambda: flow.kickoff(
+                inputs={
+                    "job_description": job,
+                    "resumes": staged,
+                }
+            )
+        )
+
+        return {
+            "agent": "Resume Screening Flow",
+            "status": "success",
+            "resumes_processed": len(staged),
+            "result": str(result),
+        }
+
+    except HTTPException:
+        raise
+
     except Exception as exc:
-        raise HTTPException(502, f"Resume Screening Flow failed: {type(exc).__name__}. Check the server log.")
-    for item in staged: Path(item["path"]).unlink(missing_ok=True)
-    return {"agent": "Resume Screening Flow", "result": result}
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Resume Screening Flow failed: {type(exc).__name__}. "
+                "Check the server logs."
+            ),
+        )
 
-
+    finally:
+        for item in staged:
+            Path(item["path"]).unlink(missing_ok=True)
 # ---------------------------------------------------------------------------
 # Agent 7 — Bug Triage Flow + category-specific crews
 # ---------------------------------------------------------------------------
