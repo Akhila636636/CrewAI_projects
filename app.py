@@ -26,6 +26,34 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 app = FastAPI(title="CREWAI Agent Hub", version="1.0.0")
 
 
+def unwrap_inputs(payload):
+    """Require the common request envelope: {"inputs": {...}}."""
+    if not isinstance(payload, dict) or "inputs" not in payload:
+        raise HTTPException(422, "Request body must contain an 'inputs' field.")
+    value = payload["inputs"]
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        # Permit a single text input where a route expects one main text field.
+        return {"text": value}
+    raise HTTPException(422, "'inputs' must be an object or text string.")
+
+
+def parse_form_inputs(value):
+    """Parse the multipart 'inputs' field as a JSON object or plain text."""
+    if value is None or not str(value).strip():
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {"text": str(value).strip()}
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, str):
+        return {"text": parsed}
+    raise HTTPException(422, "Multipart 'inputs' must be a JSON object or text string.")
+
+
 @app.get("/", response_class=HTMLResponse, summary="CREWAI Agent Hub")
 def home():
     return """
@@ -37,16 +65,16 @@ def home():
     </style></head><body><h1>CREWAI Agent Hub</h1>
     <p>Ten CrewAI learning projects powered by Gemini. Use the interactive API docs to send inputs.</p>
     <p><a href="/docs">Open API docs (/docs)</a></p>
-    <div class="card"><b>Agent 1 — Blog Post Crew</b><br><code>POST /agent1</code> JSON: <code>{"topic":"..."}</code></div>
-    <div class="card"><b>Agent 2 — Competitor Analysis Crew</b><br><code>POST /agent2</code> JSON: exactly three URLs in <code>competitors</code>.</div>
-    <div class="card"><b>Agent 3 — Meeting Notes Crew</b><br><code>POST /agent3</code> JSON transcript or multipart transcript file.</div>
-    <div class="card"><b>Agent 4 — Data Report Crew</b><br><code>POST /agent4</code> CSV upload or JSON <code>csv_content</code>.</div>
-    <div class="card"><b>Agent 5 — Customer Support Flow</b><br><code>POST /agent5</code> JSON: <code>{"ticket":"..."}</code></div>
-    <div class="card"><b>Agent 6 — Resume Screening Flow</b><br><code>POST /agent6</code> multipart: <code>job_description</code> and one or more TXT/PDF files under <code>resumes</code>.</div>
-    <div class="card"><b>Agent 7 — Bug Triage Flow</b><br><code>POST /agent7</code> JSON: <code>{"title":"...","body":"..."}</code></div>
-    <div class="card"><b>Agent 8 — Content Repurposing Flow</b><br><code>POST /agent8</code> JSON article text or public <code>article</code> URL.</div>
-    <div class="card"><b>Agent 9 — Lead Qualification Flow</b><br><code>POST /agent9</code> JSON: name, website and optional business_need, budget, timeline.</div>
-    <div class="card"><b>Agent 10 — Approval Report Flow</b><br><code>POST /agent10</code> creates a draft; <code>POST /agent10/review</code> handles approval/revision.</div>
+    <div class="card"><b>Agent 1 — Blog Post Crew</b><br><code>POST /agent1</code> JSON: <code>{"inputs":{"topic":"..."}}</code></div>
+    <div class="card"><b>Agent 2 — Competitor Analysis Crew</b><br><code>POST /agent2</code> JSON: <code>{"inputs":{"competitors":["url1","url2","url3"]}}</code>.</div>
+    <div class="card"><b>Agent 3 — Meeting Notes Crew</b><br><code>POST /agent3</code> JSON: <code>{"inputs":{"transcript":"..."}}</code>; multipart uses <code>inputs</code> plus optional file.</div>
+    <div class="card"><b>Agent 4 — Data Report Crew</b><br><code>POST /agent4</code> CSV upload or JSON <code>{"inputs":{"csv_content":"..."}}</code>.</div>
+    <div class="card"><b>Agent 5 — Customer Support Flow</b><br><code>POST /agent5</code> JSON: <code>{"inputs":{"ticket":"..."}}</code></div>
+    <div class="card"><b>Agent 6 — Resume Screening Flow</b><br><code>POST /agent6</code> multipart: <code>inputs</code> JSON with <code>job_description</code>, plus TXT/PDF files under <code>resumes</code>.</div>
+    <div class="card"><b>Agent 7 — Bug Triage Flow</b><br><code>POST /agent7</code> JSON: <code>{"inputs":{"title":"...","body":"..."}}</code></div>
+    <div class="card"><b>Agent 8 — Content Repurposing Flow</b><br><code>POST /agent8</code> JSON: <code>{"inputs":{"article":"..."}}</code>.</div>
+    <div class="card"><b>Agent 9 — Lead Qualification Flow</b><br><code>POST /agent9</code> JSON: <code>{"inputs":{"name":"...","website":"..."}}</code> and optional details.</div>
+    <div class="card"><b>Agent 10 — Approval Report Flow</b><br><code>POST /agent10</code> use <code>{"inputs":{"topic":"...","audience":"..."}}</code>; review endpoint also uses <code>inputs</code>.</div>
     </body></html>
     """
 
@@ -58,7 +86,7 @@ def health():
 
 @app.post("/agent1", summary="Blog Post Crew")
 async def agent1(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     topic = str(data.get("topic", "")).strip()
     if not topic:
         raise HTTPException(422, "topic is required and must not be empty.")
@@ -131,7 +159,7 @@ async def agent1(request: Request):
 
 @app.post("/agent2", summary="Competitor Analysis Crew")
 async def agent2(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     competitors = data.get("competitors")
     if not isinstance(competitors, list) or len(competitors) != 3:
         raise HTTPException(422, "competitors must contain exactly three website URLs.")
@@ -244,7 +272,8 @@ async def agent3(request: Request):
     content_type = request.headers.get("content-type", "")
     if "multipart/form-data" in content_type:
         form = await request.form()
-        transcript = str(form.get("transcript", "")).strip()
+        form_inputs = parse_form_inputs(form.get("inputs"))
+        transcript = str(form_inputs.get("transcript", form_inputs.get("text", ""))).strip()
         uploaded = form.get("file")
         if uploaded and hasattr(uploaded, "read"):
             raw = await uploaded.read(MAX_UPLOAD_BYTES + 1)
@@ -252,8 +281,8 @@ async def agent3(request: Request):
                 raise HTTPException(413, "Transcript file exceeds 5 MB.")
             transcript = raw.decode("utf-8", errors="replace").strip()
     else:
-        data = await request.json()
-        transcript = str(data.get("transcript", "")).strip()
+        data = unwrap_inputs(await request.json())
+        transcript = str(data.get("transcript", data.get("text", ""))).strip()
     if not transcript:
         raise HTTPException(422, "Provide non-empty transcript text or upload a transcript.txt file.")
     if not os.getenv("GEMINI_API_KEY"):
@@ -332,6 +361,7 @@ async def agent4(request: Request):
     content_type = request.headers.get("content-type", "")
     if "multipart/form-data" in content_type:
         form = await request.form()
+        form_inputs = parse_form_inputs(form.get("inputs"))
         uploaded = form.get("file")
         if not uploaded or not hasattr(uploaded, "read"):
             raise HTTPException(422, "Upload sales.csv using the 'file' field.")
@@ -340,9 +370,11 @@ async def agent4(request: Request):
             raise HTTPException(413, "CSV file exceeds 5 MB.")
         csv_content = raw.decode("utf-8-sig", errors="replace")
         filename = Path(getattr(uploaded, "filename", "sales.csv") or "sales.csv").name
+        if not csv_content:
+            csv_content = str(form_inputs.get("csv_content", form_inputs.get("text", ""))).strip()
     else:
-        data = await request.json()
-        csv_content = str(data.get("csv_content", "")).strip()
+        data = unwrap_inputs(await request.json())
+        csv_content = str(data.get("csv_content", data.get("text", ""))).strip()
         filename = "sales.csv"
     if not csv_content:
         raise HTTPException(422, "Provide a CSV upload or csv_content.")
@@ -468,7 +500,7 @@ class CustomerSupportFlow(Flow[SupportState]):
 
 @app.post("/agent5", summary="Customer Support Flow")
 async def agent5(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     ticket = str(data.get("ticket", "")).strip()
     if not ticket: raise HTTPException(422, "ticket is required.")
     if not os.getenv("GEMINI_API_KEY"): raise HTTPException(503, "Set GEMINI_API_KEY before running this agent.")
@@ -576,9 +608,10 @@ class ResumeScreeningFlow(Flow[ResumeState]):
 @app.post("/agent6", summary="Resume Screening Flow")
 async def agent6(request: Request):
     if "multipart/form-data" not in request.headers.get("content-type", ""):
-        raise HTTPException(415, "Use multipart/form-data with job_description and one or more TXT/PDF files named resumes.")
+        raise HTTPException(415, "Use multipart/form-data with an inputs JSON field containing job_description and one or more TXT/PDF files named resumes.")
     form = await request.form()
-    job = str(form.get("job_description", "")).strip()
+    form_inputs = parse_form_inputs(form.get("inputs"))
+    job = str(form_inputs.get("job_description", "")).strip()
     uploads = form.getlist("resumes")
     if not job: raise HTTPException(422, "job_description is required.")
     if not uploads: raise HTTPException(422, "Upload at least one TXT or PDF file under resumes.")
@@ -686,7 +719,7 @@ class BugTriageFlow(Flow[BugTriageState]):
 
 @app.post("/agent7", summary="Bug Triage Flow")
 async def agent7(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     title, body = str(data.get("title", "")).strip(), str(data.get("body", "")).strip()
     if not title or not body: raise HTTPException(422, "Both title and body are required.")
     if not os.getenv("GEMINI_API_KEY"): raise HTTPException(503, "Set GEMINI_API_KEY before running this agent.")
@@ -773,7 +806,7 @@ class ContentRepurposingFlow(Flow[ContentState]):
 
 @app.post("/agent8", summary="Content Repurposing Flow")
 async def agent8(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     article = str(data.get("article", "")).strip()
     if not article: raise HTTPException(422, "article is required: provide article text or a public URL.")
     if not os.getenv("GEMINI_API_KEY"): raise HTTPException(503, "Set GEMINI_API_KEY before running this agent.")
@@ -898,7 +931,7 @@ class LeadQualificationFlow(Flow[LeadState]):
 
 @app.post("/agent9", summary="Lead Qualification Flow")
 async def agent9(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     name, website = str(data.get("name", "")).strip(), str(data.get("website", "")).strip()
     parsed = urlparse(website)
     if not name: raise HTTPException(422, "name is required.")
@@ -963,7 +996,7 @@ class ApprovalReportFlow(Flow[ApprovalState]):
 
 @app.post("/agent10", summary="Approval Report Flow — create draft for human review")
 async def agent10(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     topic, audience = str(data.get("topic", "")).strip(), str(data.get("audience", "")).strip()
     if not topic or not audience: raise HTTPException(422, "topic and audience are required.")
     if not os.getenv("GEMINI_API_KEY"): raise HTTPException(503, "Set GEMINI_API_KEY before running this agent.")
@@ -980,7 +1013,7 @@ async def agent10(request: Request):
 
 @app.post("/agent10/review", summary="Approval Report Flow — human feedback")
 async def agent10_review(request: Request):
-    data = await request.json()
+    data = unwrap_inputs(await request.json())
     review_id = str(data.get("review_id", "")).strip()
     decision = str(data.get("review_decision", "")).strip().lower()
     feedback = str(data.get("feedback", "")).strip()
