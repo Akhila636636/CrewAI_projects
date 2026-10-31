@@ -1,4 +1,5 @@
-crewai
+pip requirements
+crewai[google-genai]
 crewai-tools
 fastapi
 uvicorn[standard]
